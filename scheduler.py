@@ -59,24 +59,57 @@ async def ensure_schedules():
     if not pending:
         return pending
 
-    scheduled = [
-        datetime.fromisoformat(item["scheduled_at"])
-        for item in pending
+    scheduled_items = [
+        item for item in pending
         if item["scheduled_at"]
     ]
+    scheduled_times = [
+        datetime.fromisoformat(item["scheduled_at"])
+        for item in scheduled_items
+    ]
 
-    if scheduled:
-        next_time = max(scheduled) + timedelta(days=1)
+    # Исправляем старое расписание, в котором всем файлам назначили
+    # одно и то же время суток с интервалом ровно в 24 часа.
+    legacy_same_time = (
+        len(scheduled_times) > 1
+        and len({
+            value.timetz().replace(tzinfo=None)
+            for value in scheduled_times
+        }) == 1
+    )
+
+    if legacy_same_time:
+        logger.warning("Legacy schedule detected; rebuilding random publication times")
+        for item in pending:
+            item["scheduled_at"] = None
+            await set_media_scheduled_time(item["id"], "")
+        scheduled_times = []
+
+    if scheduled_times:
+        next_day = max(value.date() for value in scheduled_times) + timedelta(days=1)
     else:
-        next_time = _first_schedule_time(datetime.now(TIMEZONE))
+        first_time = _first_schedule_time(datetime.now(TIMEZONE))
+        next_day = first_time.date()
 
     for item in pending:
         if item["scheduled_at"]:
             continue
 
-        await set_media_scheduled_time(item["id"], next_time.isoformat())
-        item["scheduled_at"] = next_time.isoformat()
-        next_time += timedelta(days=1)
+        if not scheduled_times and not any(
+            other["scheduled_at"] for other in pending
+        ):
+            scheduled_at = first_time
+        else:
+            scheduled_at = _random_time_on_date(
+                next_day,
+                POST_WINDOW_START,
+                POST_WINDOW_END,
+            )
+
+        await set_media_scheduled_time(item["id"], scheduled_at.isoformat())
+        item["scheduled_at"] = scheduled_at.isoformat()
+        scheduled_times.append(scheduled_at)
+        next_day = scheduled_at.date() + timedelta(days=1)
 
     return pending
 

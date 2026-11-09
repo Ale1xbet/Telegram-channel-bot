@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -419,7 +420,7 @@ async def main():
             return
         photo = message.photo[-1]
         file_info = await bot.get_file(photo.file_id)
-        file_path = MEDIA_DIR / f"{photo.file_unique_id}.jpg"
+        file_path = MEDIA_DIR / f"{photo.file_unique_id}_{uuid.uuid4().hex}.jpg"
         await bot.download_file(file_info.file_path, destination=file_path)
         await add_media(str(file_path))
         await message.answer("Фото добавлено в очередь.", reply_markup=main_keyboard)
@@ -430,7 +431,7 @@ async def main():
             return
         video = message.video
         file_info = await bot.get_file(video.file_id)
-        file_path = MEDIA_DIR / f"{video.file_unique_id}.mp4"
+        file_path = MEDIA_DIR / f"{video.file_unique_id}_{uuid.uuid4().hex}.mp4"
         await bot.download_file(file_info.file_path, destination=file_path)
         await add_media(str(file_path))
         await message.answer("Видео добавлено в очередь.", reply_markup=main_keyboard)
