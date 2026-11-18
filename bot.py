@@ -258,6 +258,25 @@ async def main():
 
     async def forward_proposal(message: Message, content_type: str, content: dict):
         user = message.from_user
+        try:
+            member = await bot.get_chat_member(CHANNEL_ID, user.id)
+        except TelegramAPIError:
+            logger.exception("Could not check channel membership for user %s", user.id)
+            await message.answer(
+                "Не удалось проверить подписку на канал. Попробуй отправить предложение позже."
+            )
+            return
+
+        is_subscriber = member.status in {"creator", "administrator", "member"}
+        if member.status == "restricted" and getattr(member, "is_member", False):
+            is_subscriber = True
+        if not is_subscriber:
+            await message.answer(
+                "Отправлять предложения могут только подписчики канала. "
+                "Подпишись на канал и отправь материал ещё раз."
+            )
+            return
+
         proposal_id = await create_proposal(
             content_type,
             json.dumps(content, ensure_ascii=False),
