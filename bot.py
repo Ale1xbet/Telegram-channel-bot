@@ -1,4 +1,6 @@
 import asyncio
+import html
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -35,6 +37,10 @@ from storage import (
     mark_media_sent,
     delete_pending_media,
     clear_pending_media,
+    add_text_media,
+    create_proposal,
+    get_pending_proposal,
+    set_proposal_status,
 )
 
 ADMIN_ID = 963194894
@@ -147,6 +153,23 @@ def clear_confirmation_keyboard():
     )
 
 
+def proposal_keyboard(proposal_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Одобрить",
+                    callback_data=f"proposal:approve:{proposal_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"proposal:reject:{proposal_id}",
+                ),
+            ]
+        ]
+    )
+
+
 async def build_queue_text(page: int = 0):
     pending = await ensure_schedules()
     total = len(pending)
@@ -157,7 +180,11 @@ async def build_queue_text(page: int = 0):
     lines = ["📥 <b>Очередь публикации</b>"]
     for index, item in enumerate(items):
         queue_index = page * PAGE_SIZE + index
-        name = Path(item["file_path"]).name
+        if item.get("content_type") == "text":
+            name = (item.get("text_content") or "Текстовый пост").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            name = name[:45] + ("…" if len(name) > 45 else "")
+        else:
+            name = Path(item["file_path"]).name
         post_time = datetime.fromisoformat(item["scheduled_at"])
         lines.append(
             f"{queue_index + 1}. <code>{name}</code> — 🕒 {format_post_time(post_time)}"
@@ -179,16 +206,41 @@ async def send_queue(message: Message, page: int = 0):
     )
 
 
-async def publish_media(bot: Bot, item):
-    file_path = Path(item["file_path"])
-    if not file_path.is_file():
-        raise FileNotFoundError(f"Файл не найден: {file_path}")
+async def publish_media(bot: Bot, item, bot_url: str | None = None):
+    content_type = item.get("content_type", "photo")
+    is_proposal = bool(item.get("is_proposal"))
+    suffix = (
+        f'\n\n<a href="{html.escape(bot_url, quote=True)}">предложка</a>'
+        if is_proposal and bot_url
+        else ""
+    )
 
-    media = FSInputFile(file_path)
-    if file_path.suffix.lower() in VIDEO_EXTENSIONS:
-        await bot.send_video(CHANNEL_ID, media)
+    if content_type == "text":
+        text = item["text_content"]
+        if is_proposal:
+            text = html.escape(text) + suffix
+            await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        else:
+            await bot.send_message(CHANNEL_ID, text)
     else:
-        await bot.send_photo(CHANNEL_ID, media)
+        file_path = Path(item["file_path"])
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Файл не найден: {file_path}")
+
+        media = FSInputFile(file_path)
+        caption = item.get("caption")
+        if is_proposal:
+            caption = html.escape(caption or "") + suffix
+        if content_type == "video" or file_path.suffix.lower() in VIDEO_EXTENSIONS:
+            await bot.send_video(
+                CHANNEL_ID, media, caption=caption,
+                parse_mode="HTML" if is_proposal else None,
+            )
+        else:
+            await bot.send_photo(
+                CHANNEL_ID, media, caption=caption,
+                parse_mode="HTML" if is_proposal else None,
+            )
 
     await mark_media_sent(item["id"])
 
@@ -200,11 +252,44 @@ async def main():
     await init_db()
 
     bot = Bot(token=BOT_TOKEN)
+    bot_info = await bot.get_me()
+    bot_url = f"https://t.me/{bot_info.username}" if bot_info.username else None
     dp = Dispatcher()
+
+    async def forward_proposal(message: Message, content_type: str, content: dict):
+        user = message.from_user
+        proposal_id = await create_proposal(
+            content_type,
+            json.dumps(content, ensure_ascii=False),
+            user.id,
+            user.full_name,
+        )
+        try:
+            await bot.copy_message(
+                chat_id=ADMIN_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+                reply_markup=proposal_keyboard(proposal_id),
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                f"📨 Предложение №{proposal_id} от {user.full_name} "
+                f"(ID: {user.id}).",
+            )
+        except TelegramAPIError:
+            await set_proposal_status(proposal_id, "delivery_failed")
+            logger.exception("Could not forward proposal id=%s to admin", proposal_id)
+            await message.answer("Не удалось передать предложение администратору. Попробуй позже.")
+            return
+        await message.answer("Спасибо! Предложение отправлено на модерацию.")
 
     @dp.message(Command("start"))
     async def start_handler(message: Message):
         if not is_admin(message):
+            await message.answer(
+                "Привет! Здесь можно предложить публикацию для канала. "
+                "Отправь текст, фото или видео с подписью — администратор проверит предложение."
+            )
             return
         await message.answer(
             "Привет! Выбери действие в меню или отправь фото/видео для очереди.",
@@ -238,10 +323,76 @@ async def main():
             return
         await message.answer(
             "Отправь фото или видео — оно попадёт в очередь. "
+            "Подписчики могут присылать боту текст, фото или видео с подписью на модерацию. "
             "В разделе «📥 Очередь» можно посмотреть расписание, открыть предпросмотр, "
-            "отправить файл вручную, удалить отдельный файл или очистить очередь.",
+            "отправить публикацию вручную, удалить отдельную публикацию или очистить очередь.",
             reply_markup=main_keyboard,
         )
+
+    @dp.message(F.text)
+    async def text_proposal_handler(message: Message):
+        if is_admin(message) or message.chat.type != "private":
+            return
+        if message.text.startswith("/"):
+            return
+        await forward_proposal(message, "text", {"text": message.text})
+
+    @dp.callback_query(F.data.startswith("proposal:"))
+    async def proposal_decision_handler(callback: CallbackQuery):
+        if callback.from_user.id != ADMIN_ID:
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+
+        _, decision, raw_id = callback.data.split(":")
+        proposal_id = int(raw_id)
+        proposal = await get_pending_proposal(proposal_id)
+        if not proposal:
+            await callback.answer("Предложение уже обработано.", show_alert=True)
+            return
+
+        if decision == "reject":
+            await set_proposal_status(proposal_id, "rejected")
+            try:
+                await bot.send_message(
+                    proposal["submitter_id"],
+                    "Спасибо за предложение! К сожалению, в этот раз оно не подойдёт для публикации.",
+                )
+            except TelegramAPIError:
+                logger.info("Could not notify submitter for rejected proposal %s", proposal_id)
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.answer("Предложение отклонено.")
+            return
+
+        try:
+            content = json.loads(proposal["content"])
+            if proposal["content_type"] == "text":
+                await add_text_media(content["text"], is_proposal=True)
+            else:
+                file_info = await bot.get_file(content["file_id"])
+                extension = ".mp4" if proposal["content_type"] == "video" else ".jpg"
+                file_path = MEDIA_DIR / f"proposal_{proposal_id}_{uuid.uuid4().hex}{extension}"
+                await bot.download_file(file_info.file_path, destination=file_path)
+                await add_media(
+                    str(file_path),
+                    caption=content.get("caption"),
+                    content_type=proposal["content_type"],
+                    is_proposal=True,
+                )
+
+            await set_proposal_status(proposal_id, "approved")
+            try:
+                await bot.send_message(
+                    proposal["submitter_id"],
+                    "Спасибо! Твоё предложение одобрено и добавлено в очередь публикации.",
+                )
+            except TelegramAPIError:
+                logger.info("Could not notify submitter for approved proposal %s", proposal_id)
+
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.answer("Одобрено и добавлено в очередь.")
+        except Exception:
+            logger.exception("Could not approve proposal id=%s", proposal_id)
+            await callback.answer("Не удалось добавить предложение в очередь.", show_alert=True)
 
     @dp.callback_query(F.data.startswith("queue:"))
     async def queue_page_handler(callback: CallbackQuery):
@@ -306,10 +457,16 @@ async def main():
             await callback.answer("Файл уже отправлен или отсутствует.", show_alert=True)
             return
 
-        await callback.message.edit_caption(
-            caption=f"Удалить файл «{Path(item['file_path']).name}» из очереди?",
-            reply_markup=delete_confirmation_keyboard(media_id),
-        )
+        if item.get("content_type") == "text":
+            await callback.message.edit_text(
+                f"Удалить текстовый пост из очереди?\n\n{item['text_content'][:500]}",
+                reply_markup=delete_confirmation_keyboard(media_id),
+            )
+        else:
+            await callback.message.edit_caption(
+                caption=f"Удалить файл «{Path(item['file_path']).name}» из очереди?",
+                reply_markup=delete_confirmation_keyboard(media_id),
+            )
         await callback.answer()
 
     @dp.callback_query(F.data.startswith("delete:yes:"))
@@ -321,10 +478,13 @@ async def main():
         media_id = int(callback.data.rsplit(":", 1)[1])
         removed = await delete_pending_media(media_id)
         if removed:
-            await callback.message.edit_caption(
-                caption="🗑 Файл удалён из очереди и с диска.",
-                reply_markup=None,
-            )
+            if callback.message.text:
+                await callback.message.edit_text("🗑 Пост удалён из очереди.", reply_markup=None)
+            else:
+                await callback.message.edit_caption(
+                    caption="🗑 Файл удалён из очереди и с диска.",
+                    reply_markup=None,
+                )
             await callback.answer("Удалено.")
         else:
             await callback.answer("Файл уже отправлен или отсутствует.", show_alert=True)
@@ -357,25 +517,35 @@ async def main():
             return
 
         post_time = datetime.fromisoformat(item["scheduled_at"])
-        file_path = Path(item["file_path"])
-        if not file_path.is_file():
-            await callback.answer("Файл не найден на диске.", show_alert=True)
-            return
-
-        caption = f"{file_path.name}\n🕒 Публикация: {format_post_time(post_time)}"
-        media = FSInputFile(file_path)
-        if file_path.suffix.lower() in VIDEO_EXTENSIONS:
-            await callback.message.answer_video(
-                media,
-                caption=caption,
+        if item.get("content_type") == "text":
+            await callback.message.answer(
+                f"📝 Текстовый пост\n🕒 Публикация: {format_post_time(post_time)}\n\n"
+                f"{item['text_content']}",
                 reply_markup=preview_keyboard(media_id),
             )
         else:
-            await callback.message.answer_photo(
-                media,
-                caption=caption,
-                reply_markup=preview_keyboard(media_id),
+            file_path = Path(item["file_path"])
+            if not file_path.is_file():
+                await callback.answer("Файл не найден на диске.", show_alert=True)
+                return
+
+            caption = (
+                f"{file_path.name}\n🕒 Публикация: {format_post_time(post_time)}"
+                + (f"\n\n{item['caption']}" if item.get("caption") else "")
             )
+            media = FSInputFile(file_path)
+            if item.get("content_type") == "video" or file_path.suffix.lower() in VIDEO_EXTENSIONS:
+                await callback.message.answer_video(
+                    media,
+                    caption=caption,
+                    reply_markup=preview_keyboard(media_id),
+                )
+            else:
+                await callback.message.answer_photo(
+                    media,
+                    caption=caption,
+                    reply_markup=preview_keyboard(media_id),
+                )
         await callback.answer()
 
     @dp.callback_query(F.data.startswith("send_now:"))
@@ -392,7 +562,7 @@ async def main():
 
         await callback.answer("Отправляю в канал…")
         try:
-            await publish_media(bot, item)
+            await publish_media(bot, item, bot_url)
         except (TelegramAPIError, OSError, FileNotFoundError) as error:
             logger.exception("Manual publication failed for media id=%s", media_id)
             error_text = str(error)[:180]
@@ -416,24 +586,40 @@ async def main():
 
     @dp.message(F.photo)
     async def photo_handler(message: Message):
-        if not is_admin(message):
-            return
         photo = message.photo[-1]
+        if not is_admin(message):
+            if message.chat.type != "private":
+                return
+            await forward_proposal(
+                message,
+                "photo",
+                {"file_id": photo.file_id, "caption": message.caption},
+            )
+            return
+
         file_info = await bot.get_file(photo.file_id)
         file_path = MEDIA_DIR / f"{photo.file_unique_id}_{uuid.uuid4().hex}.jpg"
         await bot.download_file(file_info.file_path, destination=file_path)
-        await add_media(str(file_path))
+        await add_media(str(file_path), caption=message.caption, content_type="photo")
         await message.answer("Фото добавлено в очередь.", reply_markup=main_keyboard)
 
     @dp.message(F.video)
     async def video_handler(message: Message):
-        if not is_admin(message):
-            return
         video = message.video
+        if not is_admin(message):
+            if message.chat.type != "private":
+                return
+            await forward_proposal(
+                message,
+                "video",
+                {"file_id": video.file_id, "caption": message.caption},
+            )
+            return
+
         file_info = await bot.get_file(video.file_id)
         file_path = MEDIA_DIR / f"{video.file_unique_id}_{uuid.uuid4().hex}.mp4"
         await bot.download_file(file_info.file_path, destination=file_path)
-        await add_media(str(file_path))
+        await add_media(str(file_path), caption=message.caption, content_type="video")
         await message.answer("Видео добавлено в очередь.", reply_markup=main_keyboard)
 
     scheduler_task = asyncio.create_task(scheduler_loop(bot))

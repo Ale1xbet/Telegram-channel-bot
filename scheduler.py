@@ -1,15 +1,18 @@
 import asyncio
+import html
 import logging
 import random
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+
+import aiosqlite
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
 
 from config import (
+    DB_PATH,
     CHANNEL_ID,
-    MEDIA_DIR,
     POST_WINDOW_END,
     POST_WINDOW_START,
     TIMEZONE,
@@ -54,22 +57,14 @@ def _first_schedule_time(now: datetime) -> datetime:
     return _random_time_on_date(tomorrow, POST_WINDOW_START, POST_WINDOW_END)
 
 
-async def ensure_schedules():
-    pending = await get_pending_media()
-    if not pending:
-        return pending
-
-    scheduled_items = [
-        item for item in pending
-        if item["scheduled_at"]
-    ]
+async def _schedule_regular_items(items, now: datetime):
+    scheduled_items = [item for item in items if item["scheduled_at"]]
     scheduled_times = [
         datetime.fromisoformat(item["scheduled_at"])
         for item in scheduled_items
     ]
 
-    # Исправляем старое расписание, в котором всем файлам назначили
-    # одно и то же время суток с интервалом ровно в 24 часа.
+    # Исправляем старое расписание, где всем постам назначили один час суток.
     legacy_same_time = (
         len(scheduled_times) > 1
         and len({
@@ -79,26 +74,26 @@ async def ensure_schedules():
     )
 
     if legacy_same_time:
-        logger.warning("Legacy schedule detected; rebuilding random publication times")
-        for item in pending:
+        logger.warning("Legacy regular schedule detected; rebuilding random times")
+        for item in items:
             item["scheduled_at"] = None
             await set_media_scheduled_time(item["id"], "")
         scheduled_times = []
 
     if scheduled_times:
         next_day = max(value.date() for value in scheduled_times) + timedelta(days=1)
+        first_time = None
     else:
-        first_time = _first_schedule_time(datetime.now(TIMEZONE))
+        first_time = _first_schedule_time(now)
         next_day = first_time.date()
 
-    for item in pending:
+    for item in items:
         if item["scheduled_at"]:
             continue
 
-        if not scheduled_times and not any(
-            other["scheduled_at"] for other in pending
-        ):
+        if first_time is not None:
             scheduled_at = first_time
+            first_time = None
         else:
             scheduled_at = _random_time_on_date(
                 next_day,
@@ -108,22 +103,131 @@ async def ensure_schedules():
 
         await set_media_scheduled_time(item["id"], scheduled_at.isoformat())
         item["scheduled_at"] = scheduled_at.isoformat()
-        scheduled_times.append(scheduled_at)
         next_day = scheduled_at.date() + timedelta(days=1)
 
-    return pending
+
+async def _schedule_proposal_items(items, now: datetime):
+    # Учитываем уже опубликованные сегодня предложенные посты.
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT sent_at FROM media WHERE is_proposal = 1 AND sent_at IS NOT NULL"
+        )
+        sent_rows = await cursor.fetchall()
+
+    used_dates = set()
+    for (sent_at,) in sent_rows:
+        try:
+            sent_utc = datetime.fromisoformat(sent_at).replace(tzinfo=timezone.utc)
+            used_dates.add(sent_utc.astimezone(TIMEZONE).date())
+        except (TypeError, ValueError):
+            logger.warning("Could not parse proposal sent_at value: %r", sent_at)
+
+    # Сохраняем будущие даты, но просроченные и повторяющиеся переносим.
+    for item in items:
+        if not item["scheduled_at"]:
+            continue
+
+        scheduled_at = datetime.fromisoformat(item["scheduled_at"])
+        if (
+            scheduled_at.date() < now.date()
+            or scheduled_at.date() in used_dates
+            or (scheduled_at.date() == now.date() and scheduled_at <= now)
+        ):
+            item["scheduled_at"] = None
+            await set_media_scheduled_time(item["id"], "")
+        else:
+            used_dates.add(scheduled_at.date())
+
+    if items and all(not item["scheduled_at"] for item in items):
+        first_time = _first_schedule_time(now)
+        next_day = first_time.date()
+    elif used_dates:
+        first_time = None
+        next_day = max(used_dates) + timedelta(days=1)
+    else:
+        first_time = _first_schedule_time(now)
+        next_day = first_time.date()
+
+    for item in items:
+        if item["scheduled_at"]:
+            continue
+
+        while next_day in used_dates:
+            next_day += timedelta(days=1)
+
+        if first_time is not None and next_day == first_time.date():
+            scheduled_at = first_time
+            first_time = None
+        else:
+            scheduled_at = _random_time_on_date(
+                next_day,
+                POST_WINDOW_START,
+                POST_WINDOW_END,
+            )
+
+        await set_media_scheduled_time(item["id"], scheduled_at.isoformat())
+        item["scheduled_at"] = scheduled_at.isoformat()
+        used_dates.add(scheduled_at.date())
+        next_day = scheduled_at.date() + timedelta(days=1)
+
+
+async def ensure_schedules():
+    pending = await get_pending_media()
+    if not pending:
+        return pending
+
+    regular_items = [item for item in pending if not item.get("is_proposal")]
+    proposal_items = [item for item in pending if item.get("is_proposal")]
+
+    now = datetime.now(TIMEZONE)
+    await _schedule_regular_items(regular_items, now)
+    await _schedule_proposal_items(proposal_items, now)
+
+    return regular_items + proposal_items
 
 
 async def publish_media(bot: Bot, item):
-    file_path = Path(item["file_path"])
-    if not file_path.is_file():
-        raise FileNotFoundError(f"Файл не найден: {file_path}")
+    content_type = item.get("content_type", "photo")
+    is_proposal = bool(item.get("is_proposal"))
 
-    media = FSInputFile(file_path)
-    if file_path.suffix.lower() in VIDEO_EXTENSIONS:
-        await bot.send_video(CHANNEL_ID, media)
+    suffix = ""
+    if is_proposal:
+        bot_info = await bot.get_me()
+        if bot_info.username:
+            bot_url = f"https://t.me/{bot_info.username}"
+            suffix = f'\n\n<a href="{html.escape(bot_url, quote=True)}">предложка</a>'
+
+    if content_type == "text":
+        text = item["text_content"] or ""
+        if is_proposal:
+            text = html.escape(text) + suffix
+            await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        else:
+            await bot.send_message(CHANNEL_ID, text)
     else:
-        await bot.send_photo(CHANNEL_ID, media)
+        file_path = Path(item["file_path"])
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Файл не найден: {file_path}")
+
+        media = FSInputFile(file_path)
+        caption = item.get("caption")
+        if is_proposal:
+            caption = html.escape(caption or "") + suffix
+
+        if content_type == "video" or file_path.suffix.lower() in VIDEO_EXTENSIONS:
+            await bot.send_video(
+                CHANNEL_ID,
+                media,
+                caption=caption,
+                parse_mode="HTML" if is_proposal else None,
+            )
+        else:
+            await bot.send_photo(
+                CHANNEL_ID,
+                media,
+                caption=caption,
+                parse_mode="HTML" if is_proposal else None,
+            )
 
     await mark_media_sent(item["id"])
 
@@ -136,7 +240,11 @@ async def scheduler_loop(bot: Bot):
                 await asyncio.sleep(30)
                 continue
 
-            first = pending[0]
+            # Берём ближайшую публикацию из обеих независимых очередей.
+            first = min(
+                pending,
+                key=lambda item: datetime.fromisoformat(item["scheduled_at"]),
+            )
             post_at = datetime.fromisoformat(first["scheduled_at"])
             delay = (post_at - datetime.now(TIMEZONE)).total_seconds()
 
@@ -146,8 +254,9 @@ async def scheduler_loop(bot: Bot):
 
             await publish_media(bot, first)
             logger.info(
-                "Scheduled media id=%s published to channel %s",
+                "Scheduled media id=%s proposal=%s published to channel %s",
                 first["id"],
+                bool(first.get("is_proposal")),
                 CHANNEL_ID,
             )
         except asyncio.CancelledError:
