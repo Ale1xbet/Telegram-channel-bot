@@ -183,7 +183,8 @@ async def ensure_schedules():
     await _schedule_regular_items(regular_items, now)
     await _schedule_proposal_items(proposal_items, now)
 
-    return regular_items + proposal_items
+    pending.sort(key=lambda item: datetime.fromisoformat(item["scheduled_at"]))
+    return pending
 
 
 async def publish_media(bot: Bot, item):

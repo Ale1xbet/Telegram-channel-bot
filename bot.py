@@ -518,9 +518,19 @@ async def main():
 
         post_time = datetime.fromisoformat(item["scheduled_at"])
         if item.get("content_type") == "text":
-            await callback.message.answer(
+            preview_text = (
                 f"📝 Текстовый пост\n🕒 Публикация: {format_post_time(post_time)}\n\n"
-                f"{item['text_content']}",
+                f"{item['text_content']}"
+            )
+            if item.get("is_proposal"):
+                preview_text = html.escape(preview_text)
+                if bot_url:
+                    preview_text += (
+                        f'\n\n<a href="{html.escape(bot_url, quote=True)}">предложка</a>'
+                    )
+            await callback.message.answer(
+                preview_text,
+                parse_mode="HTML" if item.get("is_proposal") else None,
                 reply_markup=preview_keyboard(media_id),
             )
         else:
@@ -533,17 +543,25 @@ async def main():
                 f"{file_path.name}\n🕒 Публикация: {format_post_time(post_time)}"
                 + (f"\n\n{item['caption']}" if item.get("caption") else "")
             )
+            if item.get("is_proposal"):
+                caption = html.escape(caption)
+                if bot_url:
+                    caption += (
+                        f'\n\n<a href="{html.escape(bot_url, quote=True)}">предложка</a>'
+                    )
             media = FSInputFile(file_path)
             if item.get("content_type") == "video" or file_path.suffix.lower() in VIDEO_EXTENSIONS:
                 await callback.message.answer_video(
                     media,
                     caption=caption,
+                    parse_mode="HTML" if item.get("is_proposal") else None,
                     reply_markup=preview_keyboard(media_id),
                 )
             else:
                 await callback.message.answer_photo(
                     media,
                     caption=caption,
+                    parse_mode="HTML" if item.get("is_proposal") else None,
                     reply_markup=preview_keyboard(media_id),
                 )
         await callback.answer()
