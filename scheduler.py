@@ -187,16 +187,15 @@ async def ensure_schedules():
     return pending
 
 
-async def publish_media(bot: Bot, item):
+async def publish_media(bot: Bot, item, bot_url: str | None = None):
     content_type = item.get("content_type", "photo")
     is_proposal = bool(item.get("is_proposal"))
 
-    suffix = ""
-    if is_proposal:
-        bot_info = await bot.get_me()
-        if bot_info.username:
-            bot_url = f"https://t.me/{bot_info.username}"
-            suffix = f'\n\n<a href="{html.escape(bot_url, quote=True)}">предложка</a>'
+    suffix = (
+        f'\n\n<a href="{html.escape(bot_url, quote=True)}">предложка</a>'
+        if is_proposal and bot_url
+        else ""
+    )
 
     if content_type == "text":
         text = item["text_content"] or ""
@@ -233,7 +232,7 @@ async def publish_media(bot: Bot, item):
     await mark_media_sent(item["id"])
 
 
-async def scheduler_loop(bot: Bot):
+async def scheduler_loop(bot: Bot, bot_url: str | None = None):
     while True:
         try:
             pending = await ensure_schedules()
@@ -253,7 +252,7 @@ async def scheduler_loop(bot: Bot):
                 await asyncio.sleep(min(delay, 30))
                 continue
 
-            await publish_media(bot, first)
+            await publish_media(bot, first, bot_url)
             logger.info(
                 "Scheduled media id=%s proposal=%s published to channel %s",
                 first["id"],

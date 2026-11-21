@@ -659,7 +659,7 @@ async def main():
         await add_media(str(file_path), caption=message.caption, content_type="video")
         await message.answer("Видео добавлено в очередь.", reply_markup=main_keyboard)
 
-    scheduler_task = asyncio.create_task(scheduler_loop(bot))
+    scheduler_task = asyncio.create_task(scheduler_loop(bot, bot_url))
     try:
         await dp.start_polling(bot)
     finally:
